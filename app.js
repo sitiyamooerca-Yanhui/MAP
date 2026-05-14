@@ -65,6 +65,52 @@ const getTripEntries = (tid) => state.entries
     return (a.date || '').localeCompare(b.date || '');
   });
 const getTransport = (k) => TRANSPORTS.find(t => t.key === k) || TRANSPORTS[1];
+
+/* ═══ GCJ-02 ↔ WGS-84 COORDINATE CONVERSION ═══ */
+const GCJ = (() => {
+  const PI = Math.PI, a = 6378245.0, ee = 0.00669342162296594323;
+  function outOfChina(lat, lng) {
+    return lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271;
+  }
+  function transformLat(x, y) {
+    let r = -100 + 2*x + 3*y + 0.2*y*y + 0.1*x*y + 0.2*Math.sqrt(Math.abs(x));
+    r += (20*Math.sin(6*x*PI) + 20*Math.sin(2*x*PI)) * 2/3;
+    r += (20*Math.sin(y*PI) + 40*Math.sin(y/3*PI)) * 2/3;
+    r += (160*Math.sin(y/12*PI) + 320*Math.sin(y*PI/30)) * 2/3;
+    return r;
+  }
+  function transformLng(x, y) {
+    let r = 300 + x + 2*y + 0.1*x*x + 0.1*x*y + 0.1*Math.sqrt(Math.abs(x));
+    r += (20*Math.sin(6*x*PI) + 20*Math.sin(2*x*PI)) * 2/3;
+    r += (20*Math.sin(x*PI) + 40*Math.sin(x/3*PI)) * 2/3;
+    r += (150*Math.sin(x/12*PI) + 300*Math.sin(x/30*PI)) * 2/3;
+    return r;
+  }
+  return {
+    wgs84ToGcj02(lat, lng) {
+      if (outOfChina(lat, lng)) return [lat, lng];
+      let dLat = transformLat(lng - 105, lat - 35);
+      let dLng = transformLng(lng - 105, lat - 35);
+      const radLat = lat / 180 * PI;
+      let magic = Math.sin(radLat);
+      magic = 1 - ee * magic * magic;
+      const sqrtMagic = Math.sqrt(magic);
+      dLat = (dLat * 180) / ((a * (1 - ee)) / (magic * sqrtMagic) * PI);
+      dLng = (dLng * 180) / (a / sqrtMagic * Math.cos(radLat) * PI);
+      return [lat + dLat, lng + dLng];
+    }
+  };
+})();
+
+/** Convert [lat,lng] for current tile source. 高德=GCJ-02, OSM=WGS-84 */
+function mapCoord(lat, lng) {
+  if (mapLang === 'zh') return GCJ.wgs84ToGcj02(lat, lng);
+  return [lat, lng];
+}
+function mapLL(lat, lng) {
+  const [la, lo] = mapCoord(lat, lng);
+  return L.latLng(la, lo);
+}
 const fmtDate = (e) => {
   if (!e.date) return '';
   return e.dateEnd && e.dateEnd !== e.date ? `${e.date} — ${e.dateEnd}` : e.date;
@@ -295,7 +341,7 @@ function haversineKm(a, b) {
 }
 
 function lineForTrip(t) {
-  const pts = getTripEntries(t.id).map(e => [e.lat, e.lng]);
+  const pts = getTripEntries(t.id).map(e => mapCoord(e.lat, e.lng));
   if (pts.length < 2) return [];
   const style = state.tweaks.lineStyle;
   const out = [];
@@ -466,7 +512,7 @@ function entryColor(e) {
 }
 
 function addEntryMarker(e) {
-  const m = L.marker([e.lat, e.lng], { icon: makeIcon(entryColor(e)) })
+  const m = L.marker(mapLL(e.lat, e.lng), { icon: makeIcon(entryColor(e)) })
     .addTo(map)
     .bindTooltip(esc(e.title || '未命名'), { direction: 'top' });
   m.on('click', (ev) => { L.DomEvent.stopPropagation(ev); openView(e.id); });
@@ -777,7 +823,7 @@ function reorderTripEntries(tripId, draggedId, targetId, before) {
 }
 
 function flyToAndOpen(e) {
-  map.flyTo([e.lat, e.lng], Math.max(map.getZoom(), 9), { duration: .6 });
+  map.flyTo(mapLL(e.lat, e.lng), Math.max(map.getZoom(), 9), { duration: .6 });
   setTimeout(() => openView(e.id), 400);
 }
 
@@ -987,7 +1033,7 @@ function pickGeocodeResult(r) {
     if (opt) $('#f-prov').value = opt.value;
   }
   // Recenter map preview
-  if (map) map.flyTo([r.lat, r.lng], Math.max(map.getZoom(), 9), { duration: .5 });
+  if (map) map.flyTo(mapLL(r.lat, r.lng), Math.max(map.getZoom(), 9), { duration: .5 });
   toast('已定位到：' + r.name);
 }
 
@@ -1481,10 +1527,10 @@ function saveWizard() {
   // Fit to trip
   const es = getTripEntries(tripId);
   if (es.length > 1) {
-    const b = L.latLngBounds(es.map(e => [e.lat, e.lng]));
+    const b = L.latLngBounds(es.map(e => mapCoord(e.lat, e.lng)));
     setTimeout(() => map.flyToBounds(b, { padding: [80, 80], duration: .8 }), 200);
   } else if (es.length === 1) {
-    setTimeout(() => map.flyTo([es[0].lat, es[0].lng], 9, { duration: .6 }), 200);
+    setTimeout(() => map.flyTo(mapLL(es[0].lat, es[0].lng), 9, { duration: .6 }), 200);
   }
 }
 
@@ -1664,7 +1710,7 @@ function pickSearchResult(idx) {
   else if (r.type === 'trip') {
     const es = getTripEntries(r.obj.id);
     if (es.length) {
-      const bounds = L.latLngBounds(es.map(e => [e.lat, e.lng]));
+      const bounds = L.latLngBounds(es.map(e => mapCoord(e.lat, e.lng)));
       map.flyToBounds(bounds, { padding: [80, 80], duration: .8 });
     }
   }
@@ -1952,6 +1998,7 @@ function bindUI() {
     mapLang = btn.dataset.lang;
     $$('.mlt-btn').forEach(b => b.classList.toggle('active', b.dataset.lang === mapLang));
     setTiles();
+    refreshMap(); // Re-draw all markers/lines with correct coordinates
   });
 
   // Keyboard
