@@ -98,6 +98,17 @@ const GCJ = (() => {
       dLat = (dLat * 180) / ((a * (1 - ee)) / (magic * sqrtMagic) * PI);
       dLng = (dLng * 180) / (a / sqrtMagic * Math.cos(radLat) * PI);
       return [lat + dLat, lng + dLng];
+    },
+    gcj02ToWgs84(lat, lng) {
+      // Iterative inverse: apply forward, compute delta, subtract
+      if (outOfChina(lat, lng)) return [lat, lng];
+      let wLat = lat, wLng = lng;
+      for (let i = 0; i < 3; i++) {
+        const [gLat, gLng] = this.wgs84ToGcj02(wLat, wLng);
+        wLat += lat - gLat;
+        wLng += lng - gLng;
+      }
+      return [wLat, wLng];
     }
   };
 })();
@@ -111,6 +122,15 @@ function mapCoord(lat, lng) {
 function mapLL(lat, lng) {
   const [la, lo] = mapCoord(lat, lng);
   return L.latLng(la, lo);
+}
+/** Convert map-click latlng (tile coordinate system) back to WGS-84 for storage */
+function toWgs84(lat, lng) {
+  if (lat == null || lng == null) return { lat, lng };
+  if (mapLang === 'zh') {
+    const [wLat, wLng] = GCJ.gcj02ToWgs84(lat, lng);
+    return { lat: wLat, lng: wLng };
+  }
+  return { lat, lng };
 }
 const fmtDate = (e) => {
   if (!e.date) return '';
@@ -384,7 +404,10 @@ function initMap() {
   });
   L.control.zoom({ position: 'bottomright' }).addTo(map);
   setTiles();
-  map.on('click', (e) => openForm(e.latlng));
+  map.on('click', (e) => {
+    const wgs = toWgs84(e.latlng.lat, e.latlng.lng);
+    openForm(wgs);
+  });
   loadProvinces();
 }
 
@@ -516,10 +539,29 @@ function entryColor(e) {
 
 function addEntryMarker(e) {
   if (e.lat == null || e.lng == null) return; // skip unpositioned entries
-  const m = L.marker(mapLL(e.lat, e.lng), { icon: makeIcon(entryColor(e)) })
+  const m = L.marker(mapLL(e.lat, e.lng), {
+    icon: makeIcon(entryColor(e)),
+    draggable: true,
+  })
     .addTo(map)
     .bindTooltip(esc(e.title || '未命名'), { direction: 'top' });
   m.on('click', (ev) => { L.DomEvent.stopPropagation(ev); openView(e.id); });
+  m.on('dragend', () => {
+    const pos = m.getLatLng();
+    const wgs = toWgs84(pos.lat, pos.lng);
+    const entry = state.entries.find(x => x.id === e.id);
+    if (entry) {
+      entry.lat = wgs.lat;
+      entry.lng = wgs.lng;
+      saveMeta();
+      // Redraw trip lines if this entry belongs to a trip
+      if (entry.tripId) {
+        const trip = getTrip(entry.tripId);
+        if (trip) drawTripLine(trip);
+      }
+      toast('位置已更新');
+    }
+  });
   markers[e.id] = m;
 }
 
