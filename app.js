@@ -104,6 +104,7 @@ const GCJ = (() => {
 
 /** Convert [lat,lng] for current tile source. 高德=GCJ-02, OSM=WGS-84 */
 function mapCoord(lat, lng) {
+  if (lat == null || lng == null) return [lat, lng];
   if (mapLang === 'zh') return GCJ.wgs84ToGcj02(lat, lng);
   return [lat, lng];
 }
@@ -341,7 +342,9 @@ function haversineKm(a, b) {
 }
 
 function lineForTrip(t) {
-  const pts = getTripEntries(t.id).map(e => mapCoord(e.lat, e.lng));
+  const pts = getTripEntries(t.id)
+    .filter(e => e.lat != null && e.lng != null)
+    .map(e => mapCoord(e.lat, e.lng));
   if (pts.length < 2) return [];
   const style = state.tweaks.lineStyle;
   const out = [];
@@ -512,6 +515,7 @@ function entryColor(e) {
 }
 
 function addEntryMarker(e) {
+  if (e.lat == null || e.lng == null) return; // skip unpositioned entries
   const m = L.marker(mapLL(e.lat, e.lng), { icon: makeIcon(entryColor(e)) })
     .addTo(map)
     .bindTooltip(esc(e.title || '未命名'), { direction: 'top' });
@@ -528,7 +532,7 @@ function drawTripLine(t) {
     arcLabels[t.id].forEach(l => map.removeLayer(l));
     delete arcLabels[t.id];
   }
-  const entries = getTripEntries(t.id);
+  const entries = getTripEntries(t.id).filter(e => e.lat != null && e.lng != null);
   const segs = lineForTrip(t);
   if (!segs.length) return;
   const tr = getTransport(t.transport);
@@ -596,7 +600,7 @@ function updateStats() {
   const n = state.entries.length;
   let km = 0;
   state.trips.forEach(t => {
-    const es = getTripEntries(t.id);
+    const es = getTripEntries(t.id).filter(e => e.lat != null && e.lng != null);
     for (let i = 0; i < es.length - 1; i++) {
       km += haversineKm([es[i].lat, es[i].lng], [es[i+1].lat, es[i+1].lng]);
     }
@@ -1083,7 +1087,14 @@ async function saveEntry(color) {
   };
   if (state.ui.currentEntryId) {
     const i = state.entries.findIndex(e => e.id === state.ui.currentEntryId);
-    if (i !== -1) state.entries[i] = { ...state.entries[i], ...payload };
+    if (i !== -1) {
+      state.entries[i] = { ...state.entries[i], ...payload };
+      // Update coordinates if user repositioned
+      if (state.ui.tempLatLng) {
+        state.entries[i].lat = state.ui.tempLatLng.lat;
+        state.entries[i].lng = state.ui.tempLatLng.lng;
+      }
+    }
     // delete removed photos from db
     // (we don't track removals separately; simplest: skip cleanup, gc later)
     toast('已更新');
