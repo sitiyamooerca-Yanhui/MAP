@@ -17,6 +17,30 @@ const TRANSPORTS = [
   { key: 'walk',  label: '步行', icon: '🚶', dash: '2,4' },
 ];
 
+const LINE_STYLES = [
+  { key: 'solid',   label: '实线',   dash: '' },
+  { key: 'dashed',  label: '虚线',   dash: '8,4' },
+  { key: 'dotted',  label: '点线',   dash: '2,4' },
+  { key: 'dashdot', label: '点划线', dash: '8,4,2,4' },
+  { key: 'long',    label: '长虚线', dash: '12,6' },
+];
+const getLineStyle = (k) => LINE_STYLES.find(s => s.key === k) || LINE_STYLES[0];
+
+/** Detect transport icon from vehicle/train number text */
+function vehicleIcon(v) {
+  if (!v) return '';
+  const t = v.trim();
+  if (/^[GDZCTK]\d/i.test(t)) return '🚄';
+  if (/^(MU|CA|CZ|HU|3U|ZH|FM|MF|SC|KN|HO|EU|GS|PN|QW|TV|GJ|AQ|JD|Y8|DZ)\d/i.test(t)) return '✈️';
+  if (/地铁|号线/i.test(t)) return '🚇';
+  if (/公交|路$|\d{2,3}路/.test(t)) return '🚌';
+  if (/打车|滴滴|出租|的士/i.test(t)) return '🚕';
+  if (/步行|走路|徒步/i.test(t)) return '🚶';
+  if (/单车|自行车|共享|骑行/i.test(t)) return '🚲';
+  if (/电动|电瓶/i.test(t)) return '🛵';
+  return '';
+}
+
 const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
   "theme": "survey",
   "dark": false,
@@ -579,14 +603,16 @@ function drawTripLine(t) {
   const entries = getTripEntries(t.id).filter(e => e.lat != null && e.lng != null);
   const segs = lineForTrip(t);
   if (!segs.length) return;
-  const tr = getTransport(t.transport);
+  const ls = getLineStyle(t.lineStyle || 'solid');
+  // Backward compat: if trip still has old transport field, map it to a dash
+  const dashArray = ls.dash || (t.transport ? (getTransport(t.transport).dash || null) : null);
   const isExpanded = state.ui.expandedTrips.has(t.id);
 
   const arr = segs.map(pts => L.polyline(pts, {
     color: t.color,
     weight: 2.5,
     opacity: 0.85,
-    dashArray: tr.dash || null,
+    dashArray: dashArray || null,
     lineCap: 'round',
     lineJoin: 'round',
   }).addTo(map));
@@ -599,9 +625,7 @@ function drawTripLine(t) {
     const vehicle = e.vehicle || entries[i + 1].vehicle || '';
     if (!vehicle) continue;
 
-    // Is this a train/flight number? (K589, G187, MU2231, Z167, D1234, etc.)
     const isTrainOrFlight = /^[A-Za-z]+\d+/.test(vehicle.trim());
-    // Skip local transport labels unless trip is expanded in list panel
     if (!isTrainOrFlight && !isExpanded) continue;
 
     const seg = segs[i];
@@ -611,9 +635,11 @@ function drawTripLine(t) {
     if (!midPt) continue;
 
     const cls = isTrainOrFlight ? 'arc-label' : 'arc-label arc-label-minor';
+    const vIcon = vehicleIcon(vehicle);
+    const labelText = vIcon ? `${vIcon} ${esc(vehicle)}` : esc(vehicle);
     const icon = L.divIcon({
       className: 'arc-label-wrap',
-      html: `<div class="${cls}">${esc(vehicle)}</div>`,
+      html: `<div class="${cls}">${labelText}</div>`,
       iconSize: [0, 0],
       iconAnchor: [0, 0],
     });
@@ -803,7 +829,7 @@ async function renderList() {
   if (sortedTrips.length) {
     for (const t of sortedTrips) {
       const te = getTripEntries(t.id);
-      const tr = getTransport(t.transport);
+      const ls = getLineStyle(t.lineStyle || 'solid');
       const isOpen = state.ui.expandedTrips.has(t.id);
       html += `<div class="trip-item" data-trip="${t.id}">
         <div class="trip-bar" style="background:${t.color}"></div>
@@ -813,7 +839,7 @@ async function renderList() {
         <div class="trip-info" data-toggle="${t.id}">
           <div class="trip-name">${esc(t.name)}</div>
           <div class="trip-meta">
-            <span class="pip">${tr.icon} ${tr.label}</span>
+            <span class="pip"><span class="ls-preview-sm ls-${ls.key}"></span>${ls.label}</span>
             <span class="pip">${te.length} 站</span>
           </div>
         </div>
@@ -1198,15 +1224,47 @@ async function renderThumbs() {
   if (!el) return;
   const html = await Promise.all(state.ui.tempPhotos.map(async (pid, i) => {
     const url = await getPhotoURL(pid);
-    return url ? `<div class="thumb"><img src="${url}"/><button class="thumb-rm" data-rm="${i}">×</button></div>` : '';
+    return url ? `<div class="thumb" draggable="true" data-photo-idx="${i}"><img src="${url}"/><button class="thumb-rm" data-rm="${i}">×</button></div>` : '';
   }));
   el.innerHTML = html.join('');
+
+  // Delete
   el.onclick = (e) => {
     const b = e.target.closest('[data-rm]');
     if (!b) return;
     state.ui.tempPhotos.splice(+b.dataset.rm, 1);
     renderThumbs();
   };
+
+  // Drag reorder
+  let dragFrom = null;
+  el.querySelectorAll('.thumb').forEach(thumb => {
+    thumb.addEventListener('dragstart', (e) => {
+      dragFrom = +thumb.dataset.photoIdx;
+      thumb.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    thumb.addEventListener('dragend', () => {
+      thumb.classList.remove('dragging');
+      dragFrom = null;
+      el.querySelectorAll('.thumb').forEach(t => t.classList.remove('drag-over'));
+    });
+    thumb.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      el.querySelectorAll('.thumb').forEach(t => t.classList.remove('drag-over'));
+      thumb.classList.add('drag-over');
+    });
+    thumb.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const dragTo = +thumb.dataset.photoIdx;
+      if (dragFrom !== null && dragFrom !== dragTo) {
+        const [moved] = state.ui.tempPhotos.splice(dragFrom, 1);
+        state.ui.tempPhotos.splice(dragTo, 0, moved);
+        renderThumbs();
+      }
+    });
+  });
 }
 
 async function saveEntry(color) {
@@ -1298,7 +1356,7 @@ async function openView(id) {
 
 async function openSingleView(e) {
   const trip = getTrip(e.tripId);
-  const tr = trip ? getTransport(trip.transport) : null;
+  
   $('#detail-head h2').textContent = '足迹详情';
   $('#detail-sub').textContent = 'DETAIL';
 
@@ -1311,7 +1369,7 @@ async function openSingleView(e) {
       ${e.vehicle ? `<div class="view-vehicle">${esc(e.vehicle)}</div>` : ''}
       <div class="view-tags">
         ${e.province ? `<span class="view-tag info">${esc(e.province)}</span>` : ''}
-        ${trip ? `<span class="view-tag" style="background:${trip.color}1a;color:${trip.color};border-color:${trip.color}55">${tr.icon} ${esc(trip.name)}</span>` : ''}
+        ${trip ? `<span class="view-tag" style="background:${trip.color}1a;color:${trip.color};border-color:${trip.color}55">${esc(trip.name)}</span>` : ''}
       </div>
     </div>
     <div class="view-body">
@@ -1386,14 +1444,14 @@ async function openGroupedView(group) {
 async function renderGroupCard(e) {
   const photoUrls = await Promise.all((e.photoIds || []).map(getPhotoURL));
   const trip = getTrip(e.tripId);
-  const tr = trip ? getTransport(trip.transport) : null;
+  
   return `
     <div class="group-card">
       ${dateHeroHTML(e)}
       ${e.vehicle ? `<div class="view-vehicle">${esc(e.vehicle)}</div>` : ''}
       <div class="view-tags" style="margin-top:8px">
         ${e.province ? `<span class="view-tag info">${esc(e.province)}</span>` : ''}
-        ${trip ? `<span class="view-tag" style="background:${trip.color}1a;color:${trip.color};border-color:${trip.color}55">${tr.icon} ${esc(trip.name)}</span>` : ''}
+        ${trip ? `<span class="view-tag" style="background:${trip.color}1a;color:${trip.color};border-color:${trip.color}55">${esc(trip.name)}</span>` : ''}
       </div>
       ${photoUrls.filter(Boolean).length ? `<div class="view-photos" style="margin-top:12px">${photoUrls.filter(Boolean).map(u => `<img src="${u}" data-lightbox="${u}"/>`).join('')}</div>` : ''}
       ${e.notes ? `<div class="view-notes" style="margin-top:10px">${esc(e.notes)}</div>` : `<div class="view-notes-empty" style="margin-top:10px">— 暂无感想 —</div>`}
@@ -1637,7 +1695,7 @@ async function openTripWizard(editId) {
   wizState = {
     editId: editId || null,
     name: ex ? ex.name : '',
-    transport: ex ? ex.transport : 'train',
+    lineStyle: ex ? (ex.lineStyle || 'solid') : 'solid',
     color: ex ? ex.color : COLORS[1],
     stops,
     editingIdx: -1,
@@ -1662,9 +1720,9 @@ function renderWizard() {
         <input type="text" id="wiz-name" value="${esc(w.name)}" placeholder="例如：2024 川西"/>
       </div>
       <div class="field">
-        <div class="field-lbl">出行方式</div>
+        <div class="field-lbl">轨迹线型</div>
         <div class="transport-row" id="wiz-tr">
-          ${TRANSPORTS.map(t => `<div class="tr-chip ${t.key === w.transport ? 'sel' : ''}" data-tr="${t.key}">${t.icon} ${t.label}</div>`).join('')}
+          ${LINE_STYLES.map(s => `<div class="tr-chip ${s.key === w.lineStyle ? 'sel' : ''}" data-tr="${s.key}"><span class="ls-preview ls-${s.key}"></span>${s.label}</div>`).join('')}
         </div>
       </div>
       <div class="field">
@@ -1700,7 +1758,7 @@ function renderWizard() {
     if (!c) return;
     $$('.tr-chip', $('#wiz-tr')).forEach(x => x.classList.remove('sel'));
     c.classList.add('sel');
-    w.transport = c.dataset.tr;
+    w.lineStyle = c.dataset.tr;
   });
   $('#wiz-col').addEventListener('click', e => {
     const d = e.target.closest('[data-col]');
@@ -1918,7 +1976,7 @@ function saveWizard() {
   if (w.editId) {
     // EDIT MODE: reconcile
     const trip = getTrip(w.editId);
-    if (trip) { trip.name = w.name.trim(); trip.transport = w.transport; trip.color = w.color; }
+    if (trip) { trip.name = w.name.trim(); trip.lineStyle = w.lineStyle; trip.color = w.color; }
     const keptIds = new Set(w.stops.map(s => s.id).filter(Boolean));
     // Delete entries removed from wizard
     const toRemove = state.entries.filter(e => e.tripId === w.editId && !keptIds.has(e.id));
@@ -1956,7 +2014,7 @@ function saveWizard() {
 
   // CREATE MODE
   const tripId = uid();
-  state.trips.push({ id: tripId, name: w.name.trim(), transport: w.transport, color: w.color });
+  state.trips.push({ id: tripId, name: w.name.trim(), lineStyle: w.lineStyle, color: w.color });
   w.stops.forEach((s, i) => {
     state.entries.push({
       id: uid(), tripId,
@@ -1989,16 +2047,16 @@ function saveWizard() {
 function openTripModal(editId) {
   const ex = editId ? getTrip(editId) : null;
   const col = ex ? ex.color : COLORS[1];
-  const tr = ex ? ex.transport : 'train';
+  const ls = ex ? (ex.lineStyle || 'solid') : 'solid';
   showModal(ex ? '编辑轨迹' : '新建轨迹', `
     <div class="field">
       <div class="field-lbl">轨迹名称</div>
       <input type="text" id="mt-name" value="${esc(ex?.name || '')}" placeholder="例如：2024 川西"/>
     </div>
     <div class="field">
-      <div class="field-lbl">出行方式</div>
+      <div class="field-lbl">轨迹线型</div>
       <div class="transport-row" id="mt-tr">
-        ${TRANSPORTS.map(t => `<div class="tr-chip ${t.key === tr ? 'sel' : ''}" data-tr="${t.key}">${t.icon} ${t.label}</div>`).join('')}
+        ${LINE_STYLES.map(s => `<div class="tr-chip ${s.key === ls ? 'sel' : ''}" data-tr="${s.key}"><span class="ls-preview ls-${s.key}"></span>${s.label}</div>`).join('')}
       </div>
     </div>
     <div class="field">
@@ -2011,7 +2069,7 @@ function openTripModal(editId) {
     { label: '取消', cls: 'btn-cancel', cb: closeModal },
     { label: ex ? '保存' : '创建', cls: 'btn-ok', cb: () => saveTrip(editId) },
   ]);
-  let selT = tr, selC = col;
+  let selT = ls, selC = col;
   $('#mt-tr').addEventListener('click', e => {
     const c = e.target.closest('[data-tr]');
     if (!c) return;
@@ -2036,9 +2094,9 @@ function saveTrip(editId) {
   const c = window._mt.getC();
   if (editId) {
     const tr = getTrip(editId);
-    if (tr) { tr.name = name; tr.transport = t; tr.color = c; }
+    if (tr) { tr.name = name; tr.lineStyle = t; tr.color = c; }
   } else {
-    state.trips.push({ id: uid(), name, transport: t, color: c });
+    state.trips.push({ id: uid(), name, lineStyle: t, color: c });
   }
   saveMeta();
   refreshMap();
