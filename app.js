@@ -538,9 +538,11 @@ function entryColor(e) {
 }
 
 function addEntryMarker(e) {
-  if (e.lat == null || e.lng == null) return; // skip unpositioned entries
+  if (e.lat == null || e.lng == null) return;
+  const isJournal = e.type === 'journal';
+  const icon = isJournal ? makeJournalIcon() : makeIcon(entryColor(e));
   const m = L.marker(mapLL(e.lat, e.lng), {
-    icon: makeIcon(entryColor(e)),
+    icon,
     draggable: true,
   })
     .addTo(map)
@@ -1173,11 +1175,34 @@ async function doDeleteEntry(id) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   ENTRY VIEW
+   ENTRY VIEW — with same-location grouping
    ═══════════════════════════════════════════════════════════════ */
+function findNearbyEntries(e, radiusM = 200) {
+  return state.entries.filter(o => {
+    if (o.id === e.id || o.lat == null || e.lat == null) return false;
+    return haversineKm([e.lat, e.lng], [o.lat, o.lng]) * 1000 < radiusM;
+  });
+}
+
 async function openView(id) {
   const e = state.entries.find(x => x.id === id);
   if (!e) return;
+
+  // Check for journal type
+  if (e.type === 'journal') { openJournalView(id); return; }
+
+  const nearby = findNearbyEntries(e);
+
+  if (nearby.length > 0) {
+    // Grouped view: this entry + nearby ones
+    const group = [e, ...nearby].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+    await openGroupedView(group, id);
+  } else {
+    await openSingleView(e);
+  }
+}
+
+async function openSingleView(e) {
   const trip = getTrip(e.tripId);
   const tr = trip ? getTransport(trip.transport) : null;
   $('#detail-head h2').textContent = '足迹详情';
@@ -1213,6 +1238,300 @@ async function openView(id) {
   $$('[data-lightbox]', $('#detail-body')).forEach(img => {
     img.addEventListener('click', () => openLightbox(img.dataset.lightbox));
   });
+  openDetailPanel();
+}
+
+async function openGroupedView(group, activeId) {
+  const activeEntry = group.find(e => e.id === activeId) || group[0];
+  const trip = getTrip(activeEntry.tripId);
+  $('#detail-head h2').textContent = activeEntry.title || '足迹详情';
+  $('#detail-sub').textContent = `LOCATION · ${group.length} 次到访`;
+
+  // Build date tabs
+  const tabsHTML = group.map(e => {
+    const d = e.date ? new Date(e.date) : null;
+    const label = d ? `${d.getMonth()+1}.${d.getDate()}` : '—';
+    return `<button class="group-tab ${e.id === activeId ? 'active' : ''}" data-group-id="${e.id}">${label}</button>`;
+  }).join('');
+
+  // Build content for active entry
+  const html = await renderGroupCard(activeEntry);
+
+  $('#detail-body').innerHTML = `
+    <div class="group-view">
+      <div class="group-header">
+        <div class="view-title" style="margin-bottom:6px">${esc(activeEntry.title)}</div>
+        <div class="group-tabs-wrap">
+          <div class="group-tabs">${tabsHTML}</div>
+        </div>
+      </div>
+      <div class="group-card-area" id="group-card-area">
+        ${html}
+      </div>
+    </div>
+  `;
+
+  // Bind tab clicks
+  $$('.group-tab', $('#detail-body')).forEach(tab => {
+    tab.addEventListener('click', async () => {
+      const gid = tab.dataset.groupId;
+      $$('.group-tab', $('#detail-body')).forEach(t => t.classList.toggle('active', t.dataset.groupId === gid));
+      const entry = group.find(e => e.id === gid);
+      if (entry) {
+        const area = $('#group-card-area');
+        area.innerHTML = await renderGroupCard(entry);
+        // Rebind lightbox
+        $$('[data-lightbox]', area).forEach(img => {
+          img.addEventListener('click', () => openLightbox(img.dataset.lightbox));
+        });
+        // Rebind edit/delete
+        const editBtn = area.querySelector('[data-g-edit]');
+        const delBtn = area.querySelector('[data-g-del]');
+        if (editBtn) editBtn.addEventListener('click', () => openForm({lat: entry.lat, lng: entry.lng}, entry.id));
+        if (delBtn) delBtn.addEventListener('click', () => askDeleteEntry(entry.id));
+      }
+    });
+  });
+
+  // Bind first card's buttons
+  const area = $('#group-card-area');
+  $$('[data-lightbox]', area).forEach(img => {
+    img.addEventListener('click', () => openLightbox(img.dataset.lightbox));
+  });
+  const editBtn = area.querySelector('[data-g-edit]');
+  const delBtn = area.querySelector('[data-g-del]');
+  if (editBtn) editBtn.addEventListener('click', () => openForm({lat: activeEntry.lat, lng: activeEntry.lng}, activeEntry.id));
+  if (delBtn) delBtn.addEventListener('click', () => askDeleteEntry(activeEntry.id));
+
+  openDetailPanel();
+}
+
+async function renderGroupCard(e) {
+  const photoUrls = await Promise.all((e.photoIds || []).map(getPhotoURL));
+  const trip = getTrip(e.tripId);
+  const tr = trip ? getTransport(trip.transport) : null;
+  return `
+    <div class="group-card">
+      ${dateHeroHTML(e)}
+      ${e.vehicle ? `<div class="view-vehicle">${esc(e.vehicle)}</div>` : ''}
+      <div class="view-tags" style="margin-top:8px">
+        ${e.province ? `<span class="view-tag info">${esc(e.province)}</span>` : ''}
+        ${trip ? `<span class="view-tag" style="background:${trip.color}1a;color:${trip.color};border-color:${trip.color}55">${tr.icon} ${esc(trip.name)}</span>` : ''}
+      </div>
+      ${photoUrls.filter(Boolean).length ? `<div class="view-photos" style="margin-top:12px">${photoUrls.filter(Boolean).map(u => `<img src="${u}" data-lightbox="${u}"/>`).join('')}</div>` : ''}
+      ${e.notes ? `<div class="view-notes" style="margin-top:10px">${esc(e.notes)}</div>` : `<div class="view-notes-empty" style="margin-top:10px">— 暂无感想 —</div>`}
+      <div class="view-coord">
+        <span><b>纬度</b>${e.lat.toFixed(4)}°</span>
+        <span><b>经度</b>${e.lng.toFixed(4)}°</span>
+      </div>
+      <div class="view-actions">
+        <button class="view-act" data-g-edit>编辑</button>
+        <button class="view-act danger" data-g-del>删除</button>
+      </div>
+    </div>
+  `;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   JOURNAL / TRAVEL NOTES — rich-text map note
+   ═══════════════════════════════════════════════════════════════ */
+function makeJournalIcon() {
+  return L.divIcon({
+    className: 'fp-marker journal-marker',
+    html: `<div class="journal-icon">📄</div>`,
+    iconSize: [28, 28],
+    iconAnchor: [14, 14],
+    tooltipAnchor: [0, -16],
+  });
+}
+
+async function openJournalForm(latlng, editId) {
+  const ex = editId ? state.entries.find(e => e.id === editId) : null;
+  state.ui.tempLatLng = latlng || (ex ? { lat: ex.lat, lng: ex.lng } : null);
+  state.ui.currentEntryId = editId || null;
+
+  const today = new Date().toISOString().slice(0, 10);
+  $('#detail-head h2').textContent = ex ? '编辑手记' : '新建手记';
+  $('#detail-sub').textContent = ex ? 'EDIT JOURNAL' : 'NEW JOURNAL';
+
+  const content = ex?.journalContent || '';
+
+  $('#detail-body').innerHTML = `
+    <div class="journal-form">
+      <div class="field">
+        <div class="field-lbl">标题</div>
+        <input type="text" id="j-title" value="${esc(ex?.title || '')}" placeholder="例如：洛阳三日记"/>
+      </div>
+      <div class="field" style="display:flex;gap:10px">
+        <div style="flex:1">
+          <div class="field-lbl">起始日期</div>
+          <input type="date" id="j-date" value="${ex?.date || today}"/>
+        </div>
+        <div style="flex:1">
+          <div class="field-lbl">结束日期 <span class="opt">可选</span></div>
+          <input type="date" id="j-date-end" value="${ex?.dateEnd || ''}"/>
+        </div>
+      </div>
+      <div class="field">
+        <div class="field-lbl">正文</div>
+        <div class="journal-toolbar" id="j-toolbar">
+          <button data-cmd="bold" title="加粗"><b>B</b></button>
+          <button data-cmd="italic" title="斜体"><i>I</i></button>
+          <button data-cmd="insertUnorderedList" title="列表">☰</button>
+          <button data-cmd="formatBlock" data-val="h3" title="标题">H</button>
+          <button data-cmd="insertImage" title="插入图片">🖼</button>
+        </div>
+        <div class="journal-editor" id="j-editor" contenteditable="true" data-placeholder="在这里写下你的旅行记录…">${content}</div>
+      </div>
+      <div class="field">
+        <div class="field-lbl">插入照片</div>
+        <input type="file" id="j-photos" accept="image/*" multiple style="font-size:13px"/>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:14px;padding-top:14px;border-top:1px solid var(--bd);">
+        <button class="btn-save" id="j-save" style="flex:1">保存手记</button>
+        ${ex ? `<button class="btn-cancel" id="j-del">删除</button>` : ''}
+      </div>
+    </div>
+  `;
+
+  // Toolbar commands
+  $('#j-toolbar').addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('[data-cmd]');
+    if (!btn) return;
+    const cmd = btn.dataset.cmd;
+    if (cmd === 'insertImage') {
+      const input = document.createElement('input');
+      input.type = 'file'; input.accept = 'image/*';
+      input.onchange = async () => {
+        if (!input.files[0]) return;
+        const blob = await compressImageToBlob(input.files[0], 1200, 0.82);
+        const url = URL.createObjectURL(blob);
+        // Store blob for saving later
+        const pid = uid();
+        await PhotoDB.put(pid, blob);
+        document.execCommand('insertHTML', false, `<img src="${url}" data-photo-id="${pid}" class="journal-inline-img"/>`);
+      };
+      input.click();
+    } else if (btn.dataset.val) {
+      document.execCommand(cmd, false, btn.dataset.val);
+    } else {
+      document.execCommand(cmd, false, null);
+    }
+  });
+
+  // Batch photo insert
+  $('#j-photos').addEventListener('change', async (ev) => {
+    for (const file of ev.target.files) {
+      const blob = await compressImageToBlob(file, 1200, 0.82);
+      const url = URL.createObjectURL(blob);
+      const pid = uid();
+      await PhotoDB.put(pid, blob);
+      const editor = $('#j-editor');
+      editor.focus();
+      document.execCommand('insertHTML', false, `<img src="${url}" data-photo-id="${pid}" class="journal-inline-img"/>`);
+    }
+  });
+
+  // Save
+  $('#j-save').addEventListener('click', async () => {
+    const title = $('#j-title').value.trim();
+    if (!title) { toast('请填写标题'); return; }
+    if (!state.ui.tempLatLng) { toast('请先在地图上选择位置'); return; }
+
+    // Collect photo IDs from editor
+    const photoIds = [];
+    $$('img[data-photo-id]', $('#j-editor')).forEach(img => {
+      photoIds.push(img.dataset.photoId);
+    });
+
+    const payload = {
+      title,
+      type: 'journal',
+      date: $('#j-date').value || today,
+      dateEnd: $('#j-date-end').value || '',
+      journalContent: $('#j-editor').innerHTML,
+      photoIds,
+      province: '',
+    };
+
+    if (state.ui.currentEntryId) {
+      const i = state.entries.findIndex(e => e.id === state.ui.currentEntryId);
+      if (i !== -1) {
+        state.entries[i] = { ...state.entries[i], ...payload };
+        if (state.ui.tempLatLng) {
+          state.entries[i].lat = state.ui.tempLatLng.lat;
+          state.entries[i].lng = state.ui.tempLatLng.lng;
+        }
+      }
+      toast('已更新');
+    } else {
+      state.entries.push({
+        id: uid(),
+        lat: state.ui.tempLatLng.lat,
+        lng: state.ui.tempLatLng.lng,
+        color: COLORS[0],
+        ...payload,
+      });
+      toast('已创建手记');
+    }
+    saveMeta();
+    refreshMap();
+    closeDetailPanel();
+  });
+
+  if (ex) {
+    $('#j-del').addEventListener('click', () => askDeleteEntry(ex.id));
+  }
+
+  openDetailPanel();
+  setTimeout(() => $('#j-title')?.focus(), 200);
+}
+
+async function openJournalView(id) {
+  const e = state.entries.find(x => x.id === id);
+  if (!e) return;
+  $('#detail-head h2').textContent = '旅行手记';
+  $('#detail-sub').textContent = 'JOURNAL';
+
+  // Restore inline photo URLs from stored blobs
+  let content = e.journalContent || '';
+  const photoIds = content.match(/data-photo-id="([^"]+)"/g) || [];
+  for (const match of photoIds) {
+    const pid = match.replace(/data-photo-id="|"/g, '');
+    const url = await getPhotoURL(pid);
+    if (url) {
+      // Replace any broken src with the fresh blob URL
+      content = content.replace(new RegExp(`(<img[^>]*data-photo-id="${pid}"[^>]*src=")([^"]*)(")`, 'g'), `$1${url}$3`);
+    }
+  }
+
+  const dateStr = e.date ? (() => {
+    const d = new Date(e.date);
+    let s = `${d.getFullYear()}.${d.getMonth()+1}.${d.getDate()}`;
+    if (e.dateEnd) {
+      const d2 = new Date(e.dateEnd);
+      s += ` — ${d2.getMonth()+1}.${d2.getDate()}`;
+    }
+    return s;
+  })() : '';
+
+  $('#detail-body').innerHTML = `
+    <div class="journal-view">
+      <div class="journal-view-date">${dateStr}</div>
+      <div class="journal-view-title">${esc(e.title)}</div>
+      <div class="journal-view-content">${content || '<span style="color:var(--t3);font-style:italic">空白手记</span>'}</div>
+      <div class="view-coord" style="margin-top:16px">
+        <span><b>纬度</b>${e.lat?.toFixed(4) || '—'}°</span>
+        <span><b>经度</b>${e.lng?.toFixed(4) || '—'}°</span>
+      </div>
+      <div class="view-actions">
+        <button class="view-act" id="jv-edit">编辑</button>
+        <button class="view-act danger" id="jv-del">删除</button>
+      </div>
+    </div>
+  `;
+  $('#jv-edit').addEventListener('click', () => openJournalForm({lat: e.lat, lng: e.lng}, e.id));
+  $('#jv-del').addEventListener('click', () => askDeleteEntry(e.id));
   openDetailPanel();
 }
 
@@ -1999,6 +2318,11 @@ function bindUI() {
     if (state.ui.timelineOpen) closeTimeline(); else openTimeline();
   });
   $('#tool-new-trip').addEventListener('click', () => openTripWizard());
+  $('#tool-new-journal').addEventListener('click', () => {
+    const center = map.getCenter();
+    const wgs = toWgs84(center.lat, center.lng);
+    openJournalForm(wgs);
+  });
   $('#tool-export').addEventListener('click', doExport);
   $('#tool-import').addEventListener('click', doImport);
   $('#dark-toggle').addEventListener('click', () => setTweak('dark', !state.tweaks.dark));
