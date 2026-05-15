@@ -648,7 +648,8 @@ function addClusteredMarkers() {
     used.add(e.id);
     for (const o of positioned) {
       if (used.has(o.id)) continue;
-      if (haversineKm([e.lat, e.lng], [o.lat, o.lng]) * 1000 < 200) {
+      // Same name + within 200m → merge
+      if (o.title === e.title && haversineKm([e.lat, e.lng], [o.lat, o.lng]) * 1000 < 200) {
         group.push(o);
         used.add(o.id);
       }
