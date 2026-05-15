@@ -630,10 +630,104 @@ function refreshMap() {
   lines = {};
   Object.values(arcLabels).forEach(arr => arr.forEach(l => map.removeLayer(l)));
   arcLabels = {};
-  state.entries.forEach(addEntryMarker);
+  addClusteredMarkers();
   state.trips.forEach(drawTripLine);
   drawProvinces();
   updateStats();
+}
+
+/** Group nearby entries and place one marker per cluster */
+function addClusteredMarkers() {
+  const positioned = state.entries.filter(e => e.lat != null && e.lng != null);
+  const used = new Set();
+  const clusters = [];
+
+  for (const e of positioned) {
+    if (used.has(e.id)) continue;
+    const group = [e];
+    used.add(e.id);
+    for (const o of positioned) {
+      if (used.has(o.id)) continue;
+      if (haversineKm([e.lat, e.lng], [o.lat, o.lng]) * 1000 < 200) {
+        group.push(o);
+        used.add(o.id);
+      }
+    }
+    clusters.push(group);
+  }
+
+  for (const group of clusters) {
+    const anchor = group[0]; // use first entry as marker position
+    const count = group.length;
+    const isJournal = anchor.type === 'journal';
+
+    let icon;
+    if (isJournal) {
+      icon = makeJournalIcon();
+    } else if (count > 1) {
+      icon = makeClusterIcon(entryColor(anchor), count);
+    } else {
+      icon = makeIcon(entryColor(anchor));
+    }
+
+    const m = L.marker(mapLL(anchor.lat, anchor.lng), { icon, draggable: count === 1 })
+      .addTo(map)
+      .bindTooltip(esc(anchor.title || '未命名') + (count > 1 ? ` (+${count - 1})` : ''), { direction: 'top' });
+
+    m.on('click', (ev) => {
+      L.DomEvent.stopPropagation(ev);
+      if (count > 1) {
+        openGroupedView(group);
+      } else {
+        openView(anchor.id);
+      }
+    });
+
+    if (count === 1) {
+      m.on('dragend', () => {
+        const pos = m.getLatLng();
+        const wgs = toWgs84(pos.lat, pos.lng);
+        const entry = state.entries.find(x => x.id === anchor.id);
+        if (entry) {
+          entry.lat = wgs.lat;
+          entry.lng = wgs.lng;
+          saveMeta();
+          if (entry.tripId) {
+            const trip = getTrip(entry.tripId);
+            if (trip) drawTripLine(trip);
+          }
+          toast('位置已更新');
+        }
+      });
+    }
+
+    // Store marker reference for all entries in this cluster
+    for (const e of group) markers[e.id] = m;
+  }
+}
+
+function makeClusterIcon(color, count) {
+  const style = state.tweaks.markerStyle;
+  const inner = style === 'dot'
+    ? `<div style="width:18px;height:18px;border-radius:50%;background:${color};border:2.5px solid var(--sf);box-shadow:0 1px 4px rgba(0,0,0,.35);position:relative;">
+        <span class="cluster-badge">${count}</span>
+       </div>`
+    : style === 'square'
+    ? `<div style="width:16px;height:16px;background:${color};border:2px solid var(--sf);box-shadow:0 1px 4px rgba(0,0,0,.35);transform:rotate(45deg);position:relative;">
+        <span class="cluster-badge" style="transform:rotate(-45deg)">${count}</span>
+       </div>`
+    : `<svg width="22" height="30" viewBox="0 0 22 30" style="filter:drop-shadow(0 2px 3px rgba(0,0,0,.35));">
+        <path d="M11 0C4.9 0 0 4.9 0 11c0 8 11 19 11 19s11-11 11-19C22 4.9 17.1 0 11 0z" fill="${color}"/>
+        <circle cx="11" cy="11" r="3.5" fill="rgba(0,0,0,.4)"/>
+       </svg><span class="cluster-badge cluster-badge-pin">${count}</span>`;
+
+  return L.divIcon({
+    className: 'fp-marker',
+    html: inner,
+    iconSize: style === 'pin' ? [22, 30] : [20, 20],
+    iconAnchor: style === 'pin' ? [11, 30] : [10, 10],
+    tooltipAnchor: style === 'pin' ? [0, -28] : [0, -12],
+  });
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1194,9 +1288,8 @@ async function openView(id) {
   const nearby = findNearbyEntries(e);
 
   if (nearby.length > 0) {
-    // Grouped view: this entry + nearby ones
     const group = [e, ...nearby].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
-    await openGroupedView(group, id);
+    await openGroupedView(group);
   } else {
     await openSingleView(e);
   }
@@ -1241,67 +1334,50 @@ async function openSingleView(e) {
   openDetailPanel();
 }
 
-async function openGroupedView(group, activeId) {
-  const activeEntry = group.find(e => e.id === activeId) || group[0];
-  const trip = getTrip(activeEntry.tripId);
-  $('#detail-head h2').textContent = activeEntry.title || '足迹详情';
-  $('#detail-sub').textContent = `LOCATION · ${group.length} 次到访`;
+async function openGroupedView(group) {
+  // Sort by date
+  const sorted = [...group].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+  const anchor = sorted[0];
+  $('#detail-head h2').textContent = anchor.title || '足迹详情';
+  $('#detail-sub').textContent = `LOCATION · ${sorted.length} 次到访`;
 
-  // Build date tabs
-  const tabsHTML = group.map(e => {
-    const d = e.date ? new Date(e.date) : null;
-    const label = d ? `${d.getMonth()+1}.${d.getDate()}` : '—';
-    return `<button class="group-tab ${e.id === activeId ? 'active' : ''}" data-group-id="${e.id}">${label}</button>`;
-  }).join('');
-
-  // Build content for active entry
-  const html = await renderGroupCard(activeEntry);
+  // Build all cards stacked vertically
+  const cards = [];
+  for (const e of sorted) {
+    cards.push(await renderGroupCard(e));
+  }
 
   $('#detail-body').innerHTML = `
     <div class="group-view">
       <div class="group-header">
-        <div class="view-title" style="margin-bottom:6px">${esc(activeEntry.title)}</div>
-        <div class="group-tabs-wrap">
-          <div class="group-tabs">${tabsHTML}</div>
-        </div>
+        <div class="view-title">${esc(anchor.title)}</div>
+        <div class="group-count">${sorted.length} 次到访</div>
       </div>
-      <div class="group-card-area" id="group-card-area">
-        ${html}
+      <div class="group-scroll">
+        ${cards.map((html, i) => `
+          <div class="group-card-wrap" data-idx="${i}">
+            <div class="group-card-divider">
+              <span class="group-card-num">${String(i + 1).padStart(2, '0')}</span>
+            </div>
+            ${html}
+          </div>
+        `).join('')}
       </div>
     </div>
   `;
 
-  // Bind tab clicks
-  $$('.group-tab', $('#detail-body')).forEach(tab => {
-    tab.addEventListener('click', async () => {
-      const gid = tab.dataset.groupId;
-      $$('.group-tab', $('#detail-body')).forEach(t => t.classList.toggle('active', t.dataset.groupId === gid));
-      const entry = group.find(e => e.id === gid);
-      if (entry) {
-        const area = $('#group-card-area');
-        area.innerHTML = await renderGroupCard(entry);
-        // Rebind lightbox
-        $$('[data-lightbox]', area).forEach(img => {
-          img.addEventListener('click', () => openLightbox(img.dataset.lightbox));
-        });
-        // Rebind edit/delete
-        const editBtn = area.querySelector('[data-g-edit]');
-        const delBtn = area.querySelector('[data-g-del]');
-        if (editBtn) editBtn.addEventListener('click', () => openForm({lat: entry.lat, lng: entry.lng}, entry.id));
-        if (delBtn) delBtn.addEventListener('click', () => askDeleteEntry(entry.id));
-      }
+  // Bind edit/delete/lightbox for all cards
+  sorted.forEach((entry, i) => {
+    const wrap = $$('.group-card-wrap', $('#detail-body'))[i];
+    if (!wrap) return;
+    $$('[data-lightbox]', wrap).forEach(img => {
+      img.addEventListener('click', () => openLightbox(img.dataset.lightbox));
     });
+    const editBtn = wrap.querySelector('[data-g-edit]');
+    const delBtn = wrap.querySelector('[data-g-del]');
+    if (editBtn) editBtn.addEventListener('click', () => openForm({lat: entry.lat, lng: entry.lng}, entry.id));
+    if (delBtn) delBtn.addEventListener('click', () => askDeleteEntry(entry.id));
   });
-
-  // Bind first card's buttons
-  const area = $('#group-card-area');
-  $$('[data-lightbox]', area).forEach(img => {
-    img.addEventListener('click', () => openLightbox(img.dataset.lightbox));
-  });
-  const editBtn = area.querySelector('[data-g-edit]');
-  const delBtn = area.querySelector('[data-g-del]');
-  if (editBtn) editBtn.addEventListener('click', () => openForm({lat: activeEntry.lat, lng: activeEntry.lng}, activeEntry.id));
-  if (delBtn) delBtn.addEventListener('click', () => askDeleteEntry(activeEntry.id));
 
   openDetailPanel();
 }
